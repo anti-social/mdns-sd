@@ -39,7 +39,7 @@ use crate::{
         CLASS_CACHE_FLUSH, CLASS_IN, FLAGS_AA, FLAGS_QR_QUERY, FLAGS_QR_RESPONSE, MAX_MSG_ABSOLUTE,
     },
     error::{e_fmt, Error, Result},
-    service_info::{DnsRegistry, MyIntf, Probe, ServiceInfo, ServiceStatus},
+    service_info::{DnsRegistry, MyIntf, Probe, ServiceInfo, ServiceStatus, valid_ip_on_intf},
     Receiver, ResolvedService, TxtProperties,
 };
 use flume::{bounded, Sender, TrySendError};
@@ -2050,14 +2050,14 @@ impl Zeroconf {
                 trace!("sending out probing of questions: {:?}", out.questions());
                 if let Some(sock) = self.ipv4_sock.as_mut() {
                     if let Err(InternalError::IntfAddrInvalid(intf_addr)) =
-                        send_dns_outgoing(&out, intf, &sock.pktinfo, self.port)
+                        send_dns_outgoing(&out, intf, None, &sock.pktinfo, self.port)
                     {
                         invalid_intf_addrs.insert(intf_addr);
                     }
                 }
                 if let Some(sock) = self.ipv6_sock.as_mut() {
                     if let Err(InternalError::IntfAddrInvalid(intf_addr)) =
-                        send_dns_outgoing(&out, intf, &sock.pktinfo, self.port)
+                        send_dns_outgoing(&out, intf, None, &sock.pktinfo, self.port)
                     {
                         invalid_intf_addrs.insert(intf_addr);
                     }
@@ -2220,7 +2220,7 @@ impl Zeroconf {
         }
 
         // Only (at most) one packet is expected to be sent out.
-        let sent_vec = match send_dns_outgoing(&out, intf, sock, self.port) {
+        let sent_vec = match send_dns_outgoing(&out, intf, None, sock, self.port) {
             Ok(sent_vec) => sent_vec,
             Err(InternalError::IntfAddrInvalid(intf_addr)) => {
                 let invalid_intf_addrs = HashSet::from([intf_addr]);
@@ -2264,14 +2264,14 @@ impl Zeroconf {
         let mut invalid_intf_addrs = HashSet::new();
         if let Some(sock) = self.ipv4_sock.as_ref() {
             if let Err(InternalError::IntfAddrInvalid(intf_addr)) =
-                send_dns_outgoing(&out, intf, &sock.pktinfo, self.port)
+                send_dns_outgoing(&out, intf, None, &sock.pktinfo, self.port)
             {
                 invalid_intf_addrs.insert(intf_addr);
             }
         }
         if let Some(sock) = self.ipv6_sock.as_ref() {
             if let Err(InternalError::IntfAddrInvalid(intf_addr)) =
-                send_dns_outgoing(&out, intf, &sock.pktinfo, self.port)
+                send_dns_outgoing(&out, intf, None, &sock.pktinfo, self.port)
             {
                 invalid_intf_addrs.insert(intf_addr);
             }
@@ -2308,14 +2308,14 @@ impl Zeroconf {
         for (_, intf) in self.my_intfs.iter() {
             if let Some(sock) = self.ipv4_sock.as_ref() {
                 if let Err(InternalError::IntfAddrInvalid(intf_addr)) =
-                    send_dns_outgoing(&out, intf, &sock.pktinfo, self.port)
+                    send_dns_outgoing(&out, intf, None, &sock.pktinfo, self.port)
                 {
                     invalid_intf_addrs.insert(intf_addr);
                 }
             }
             if let Some(sock) = self.ipv6_sock.as_ref() {
                 if let Err(InternalError::IntfAddrInvalid(intf_addr)) =
-                    send_dns_outgoing(&out, intf, &sock.pktinfo, self.port)
+                    send_dns_outgoing(&out, intf, None, &sock.pktinfo, self.port)
                 {
                     invalid_intf_addrs.insert(intf_addr);
                 }
@@ -2372,6 +2372,8 @@ impl Zeroconf {
             return true; // We still return true to indicate that we read something.
         };
 
+        let pkt_src_addr = pktinfo.addr_src.ip();
+
         // Drop packets for an IP version that has been disabled on this interface.
         // This is needed because some times the socket layer may still receive packets
         // for an IP version even after we left the multicast group for that IP version.
@@ -2393,7 +2395,7 @@ impl Zeroconf {
         match DnsIncoming::new(buf, my_intf.into()) {
             Ok(msg) => {
                 if msg.is_query() {
-                    self.handle_query(msg, pkt_if_index, event_key == IPV4_SOCK_EVENT_KEY);
+                    self.handle_query(msg, pkt_if_index, pkt_src_addr, event_key == IPV4_SOCK_EVENT_KEY);
                 } else if msg.is_response() {
                     self.handle_response(msg, pkt_if_index);
                 } else {
@@ -3019,7 +3021,7 @@ impl Zeroconf {
     }
 
     /// Handle incoming query packets, figure out whether and what to respond.
-    fn handle_query(&mut self, msg: DnsIncoming, if_index: u32, is_ipv4: bool) {
+    fn handle_query(&mut self, msg: DnsIncoming, if_index: u32, src_addr: IpAddr, is_ipv4: bool) {
         let sock_opt = if is_ipv4 {
             &self.ipv4_sock
         } else {
@@ -3056,7 +3058,9 @@ impl Zeroconf {
                     }
 
                     if service.matches_type_or_subtype(q_name) {
-                        out.add_answer_with_additionals(&msg, service, intf, dns_registry, is_ipv4);
+                        out.add_answer_with_additionals(
+                            &msg, service, src_addr, intf.into(), dns_registry
+                        );
                     } else if q_name == META_QUERY {
                         let ttl = service.get_other_ttl();
                         let alias = service.get_type().to_string();
@@ -3103,19 +3107,17 @@ impl Zeroconf {
                                 );
                                 return;
                             }
-                            for address in intf_addrs {
-                                out.add_answer(
-                                    &msg,
-                                    DnsAddress::new(
-                                        service_hostname,
-                                        ip_address_rr_type(&address),
-                                        CLASS_IN | CLASS_CACHE_FLUSH,
-                                        service.get_host_ttl(),
-                                        address,
-                                        intf.into(),
-                                    ),
-                                );
-                            }
+                            out.add_answer(
+                                &msg,
+                                DnsAddress::new(
+                                    service_hostname,
+                                    ip_address_rr_type(&src_addr),
+                                    CLASS_IN | CLASS_CACHE_FLUSH,
+                                    service.get_host_ttl(),
+                                    src_addr,
+                                    intf.into(),
+                                ),
+                            );
                         }
                     }
                 }
@@ -3154,16 +3156,19 @@ impl Zeroconf {
                     question.entry_name(),
                     service,
                     qtype,
-                    intf_addrs,
+                    &src_addr,
                 );
             }
         }
 
         if out.answers_count() > 0 {
             debug!("sending response on intf {}", &intf.name);
+            let first_valid_intf_addr = intf.addrs.iter()
+                .filter(|if_addr| valid_ip_on_intf(&src_addr, if_addr))
+                .next();
             out.set_id(msg.id());
             if let Err(InternalError::IntfAddrInvalid(intf_addr)) =
-                send_dns_outgoing(&out, intf, &sock.pktinfo, self.port)
+                send_dns_outgoing(&out, intf, first_valid_intf_addr, &sock.pktinfo, self.port)
             {
                 let invalid_intf_addr = HashSet::from([intf_addr]);
                 let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addr));
@@ -3762,7 +3767,7 @@ fn add_answer_of_service(
     entry_name: &str,
     service: &ServiceInfo,
     qtype: RRType,
-    intf_addrs: Vec<IpAddr>,
+    addr: &IpAddr,
 ) {
     if qtype == RRType::SRV || qtype == RRType::ANY {
         out.add_answer(
@@ -3792,16 +3797,14 @@ fn add_answer_of_service(
     }
 
     if qtype == RRType::SRV {
-        for address in intf_addrs {
-            out.add_additional_answer(DnsAddress::new(
-                service.get_hostname(),
-                ip_address_rr_type(&address),
-                CLASS_IN | CLASS_CACHE_FLUSH,
-                service.get_host_ttl(),
-                address,
-                InterfaceId::default(),
-            ));
-        }
+        out.add_additional_answer(DnsAddress::new(
+            service.get_hostname(),
+            ip_address_rr_type(addr),
+            CLASS_IN | CLASS_CACHE_FLUSH,
+            service.get_host_ttl(),
+            *addr,
+            InterfaceId::default(),
+        ));
     }
 }
 
@@ -4138,24 +4141,29 @@ fn is_apple_p2p_by_name(name: &str) -> bool {
 fn send_dns_outgoing(
     out: &DnsOutgoing,
     my_intf: &MyIntf,
+    if_addr: Option<&IfAddr>,
     sock: &PktInfoUdpSocket,
     port: u16,
 ) -> MyResult<Vec<Vec<u8>>> {
     let if_name = &my_intf.name;
-
-    let if_addr = if sock.domain() == Domain::IPV4 {
-        match my_intf.next_ifaddr_v4() {
-            Some(addr) => addr,
-            None => return Ok(vec![]),
-        }
+    if let Some(if_addr) = if_addr {
+        send_dns_outgoing_impl(out, if_name, my_intf.index, if_addr, sock, port)
     } else {
-        match my_intf.next_ifaddr_v6() {
-            Some(addr) => addr,
-            None => return Ok(vec![]),
+        let if_addrs: Vec<_> = if sock.domain() == Domain::IPV4 {
+            my_intf.addrs.iter()
+                .filter(|addr| addr.ip().is_ipv4())
+                .collect()
+        } else {
+            my_intf.addrs.iter()
+                .filter(|addr| addr.ip().is_ipv6())
+                .collect()
+        };
+        let mut res = vec![];
+        for if_addr in if_addrs {
+            res = send_dns_outgoing_impl(out, if_name, my_intf.index, if_addr, sock, port)?;
         }
-    };
-
-    send_dns_outgoing_impl(out, if_name, my_intf.index, if_addr, sock, port)
+        Ok(res)
+    }
 }
 
 /// Send an outgoing mDNS query or response, and returns the packet bytes.
@@ -4299,23 +4307,9 @@ fn notify_monitors(monitors: &mut Vec<Sender<DaemonEvent>>, event: DaemonEvent) 
 fn prepare_announce(
     info: &ServiceInfo,
     intf: &MyIntf,
+    intf_addrs: Vec<IpAddr>,
     dns_registry: &mut DnsRegistry,
-    is_ipv4: bool,
 ) -> Option<DnsOutgoing> {
-    let intf_addrs = if is_ipv4 {
-        info.get_addrs_on_my_intf_v4(intf)
-    } else {
-        info.get_addrs_on_my_intf_v6(intf)
-    };
-
-    if intf_addrs.is_empty() {
-        debug!(
-            "prepare_announce (ipv4: {is_ipv4}): no valid addrs on interface {}",
-            &intf.name
-        );
-        return None;
-    }
-
     // check if we changed our name due to conflicts.
     let service_fullname = dns_registry.resolve_name(info.get_fullname());
 
@@ -4442,12 +4436,30 @@ fn announce_service_on_intf(
     port: u16,
 ) -> MyResult<bool> {
     let is_ipv4 = sock.domain() == Domain::IPV4;
-    if let Some(out) = prepare_announce(info, intf, dns_registry, is_ipv4) {
-        let _ = send_dns_outgoing(&out, intf, sock, port)?;
-        return Ok(true);
+    let if_addrs: Vec<_> = if is_ipv4 {
+        intf.addrs.iter()
+            .filter(|addr| addr.ip().is_ipv4())
+            .collect()
+    } else {
+        intf.addrs.iter()
+            .filter(|addr| addr.ip().is_ipv6())
+            .collect()
+    };
+    if if_addrs.is_empty() {
+        debug!(
+            "announce_service_on_intf (ipv4: {is_ipv4}): no valid addrs on interface {}",
+            &intf.name
+        );
+        return Ok(false);
     }
 
-    Ok(false)
+    for addr in if_addrs {
+        if let Some(out) = prepare_announce(info, intf, vec![addr.ip()], dns_registry) {
+            let _ = send_dns_outgoing(&out, intf, Some(&addr), sock, port)?;
+        }
+    }
+
+    Ok(true)
 }
 
 /// Returns a new name based on the `original` to avoid conflicts.

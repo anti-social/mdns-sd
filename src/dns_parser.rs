@@ -9,7 +9,7 @@ use crate::log::trace;
 
 use crate::current_time_millis;
 use crate::error::{e_fmt, Error, Result};
-use crate::service_info::{is_unicast_link_local, DnsRegistry, MyIntf, ServiceInfo};
+use crate::service_info::{is_unicast_link_local, DnsRegistry, ServiceInfo};
 
 use if_addrs::Interface;
 
@@ -1849,20 +1849,10 @@ impl DnsOutgoing {
         &mut self,
         msg: &DnsIncoming,
         service: &ServiceInfo,
-        intf: &MyIntf,
+        addr: IpAddr,
+        if_id: InterfaceId,
         dns_registry: &DnsRegistry,
-        is_ipv4: bool,
     ) {
-        let intf_addrs = if is_ipv4 {
-            service.get_addrs_on_my_intf_v4(intf)
-        } else {
-            service.get_addrs_on_my_intf_v6(intf)
-        };
-        if intf_addrs.is_empty() {
-            trace!("No addrs on LAN of intf {:?}", intf);
-            return;
-        }
-
         // check if we changed our name due to conflicts.
         let service_fullname = dns_registry.resolve_name(service.get_fullname());
         let hostname = dns_registry.resolve_name(service.get_hostname());
@@ -1913,16 +1903,14 @@ impl DnsOutgoing {
             service.generate_txt(),
         ));
 
-        for address in intf_addrs {
-            self.add_additional_answer(DnsAddress::new(
-                hostname,
-                ip_address_rr_type(&address),
-                CLASS_IN | CLASS_CACHE_FLUSH,
-                service.get_host_ttl(),
-                address,
-                intf.into(),
-            ));
-        }
+        self.add_additional_answer(DnsAddress::new(
+            hostname,
+            ip_address_rr_type(&addr),
+            CLASS_IN | CLASS_CACHE_FLUSH,
+            service.get_host_ttl(),
+            addr,
+            if_id,
+        ));
     }
 
     pub fn add_question(&mut self, name: &str, qtype: RRType) {
